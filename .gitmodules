@@ -1,0 +1,3 @@
+[submodule "koliseo-sys/koliseo"]
+	path = koliseo-sys/koliseo
+	url = https://github.com/jgabaut/koliseo

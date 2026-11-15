@@ -1,0 +1,13 @@
+[package]
+name = "koliseo-sys"
+version = "0.0.0"
+edition = "2024"
+repository = "https://github.com/jgabaut/koliseo-rs"
+license = "GPL-3.0-only"
+description = "Raw FFI bindings for koliseo"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.73.2"
+cc = "1.11.2"
