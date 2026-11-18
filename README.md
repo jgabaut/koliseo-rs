@@ -4,5 +4,5 @@ koliseo-rs is a work-in-progress Rust binding for [koliseo](https://github.com/j
 
 This repo contains:
 
-- [koliseo](./koliseo) (safe wrapper)
-- [koliseo-sys](./koliseo-sys) (raw FFI)
+- [koliseo](https://github.com/jgabaut/koliseo-rs/tree/master/koliseo) (safe wrapper)
+- [koliseo-sys](https://github.com/jgabaut/koliseo-rs/tree/master/koliseo-sys) (raw FFI)
