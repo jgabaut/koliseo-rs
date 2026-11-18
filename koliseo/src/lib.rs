@@ -23,7 +23,7 @@
 /// ```rust
 /// use koliseo::Koliseo;
 ///
-/// let arena = Koliseo::new(1024).expect("failed to create arena");
+/// let arena = Koliseo::new(2048).expect("failed to create arena");
 ///
 /// let number = arena.alloc(42_u32).expect("allocation failed");
 /// let text = arena
@@ -108,6 +108,35 @@
 ///
 /// assert_eq!(DROPPED.load(Ordering::SeqCst), 3);
 /// ```
+///
+/// /// ## Allocation scopes
+///
+/// Objects allocated within a scope are destroyed when
+/// the scope ends.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// static DROPPED: AtomicUsize = AtomicUsize::new(0);
+///
+/// struct MyObject;
+///
+/// impl Drop for MyObject {
+///     fn drop(&mut self) {
+///         DROPPED.fetch_add(1, Ordering::SeqCst);
+///     }
+/// }
+///
+/// let mut arena = Koliseo::new(1024).unwrap();
+///
+/// arena.scope(|scope| {
+///     scope.alloc_slice_with(3, |_| MyObject).unwrap();
+///     assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
+/// });
+///
+/// assert_eq!(DROPPED.load(Ordering::SeqCst), 3);
+/// ```
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -166,6 +195,136 @@ impl<T> Drop for SliceInitGuard<T> {
     }
 }
 
+trait ArenaAlloc {
+    fn arena_ptr(&self) -> NonNull<koliseo_sys::Koliseo>;
+
+    fn destructors(&self) -> &RefCell<Vec<Destructor>>;
+}
+
+impl ArenaAlloc for Koliseo {
+    fn arena_ptr(&self) -> NonNull<koliseo_sys::Koliseo> {
+        self.ptr
+    }
+
+    fn destructors(&self) -> &RefCell<Vec<Destructor>> {
+        &self.destructors
+    }
+}
+
+impl ArenaAlloc for KoliseoScope<'_> {
+    fn arena_ptr(&self) -> NonNull<koliseo_sys::Koliseo> {
+        self.ptr
+    }
+
+    fn destructors(&self) -> &RefCell<Vec<Destructor>> {
+        &self.destructors
+    }
+}
+
+fn alloc_impl<A: ArenaAlloc, T: 'static>(arena: &A, value: T) -> Result<&mut T, KoliseoAllocError> {
+    if std::mem::needs_drop::<T>() {
+        arena
+            .destructors()
+            .borrow_mut()
+            .try_reserve(1)
+            .map_err(|_| KoliseoAllocError)?;
+    }
+
+    let size: isize = std::mem::size_of::<T>()
+        .try_into()
+        .map_err(|_| KoliseoAllocError)?;
+
+    let alignment: isize = std::mem::align_of::<T>()
+        .try_into()
+        .map_err(|_| KoliseoAllocError)?;
+
+    let ptr = if size == 0 {
+        NonNull::<T>::dangling().as_ptr().cast::<c_void>()
+    } else {
+        unsafe { koliseo_sys::kls_push_zero(arena.arena_ptr().as_ptr(), size, alignment, 1) }
+    };
+
+    let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
+
+    unsafe {
+        ptr.as_ptr().write(value);
+    }
+
+    if std::mem::needs_drop::<T>() {
+        arena.destructors().borrow_mut().push(Destructor {
+            ptr: ptr.as_ptr().cast(),
+            len: 1,
+            drop_fn: drop_value::<T>,
+        });
+    }
+
+    unsafe { Ok(&mut *ptr.as_ptr()) }
+}
+
+fn alloc_slice_with_impl<A: ArenaAlloc, T: 'static>(
+    arena: &A,
+    len: usize,
+    mut init: impl FnMut(usize) -> T,
+) -> Result<&mut [T], KoliseoAllocError> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+
+    if std::mem::needs_drop::<T>() {
+        arena
+            .destructors()
+            .borrow_mut()
+            .try_reserve(1)
+            .map_err(|_| KoliseoAllocError)?;
+    }
+
+    let size: isize = std::mem::size_of::<T>()
+        .try_into()
+        .map_err(|_| KoliseoAllocError)?;
+
+    let alignment: isize = std::mem::align_of::<T>()
+        .try_into()
+        .map_err(|_| KoliseoAllocError)?;
+
+    let count: isize = len.try_into().map_err(|_| KoliseoAllocError)?;
+
+    let ptr = if size == 0 {
+        NonNull::<T>::dangling().as_ptr().cast::<c_void>()
+    } else {
+        unsafe { koliseo_sys::kls_push_zero(arena.arena_ptr().as_ptr(), size, alignment, count) }
+    };
+
+    let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
+
+    let mut guard = SliceInitGuard {
+        ptr,
+        initialized: 0,
+    };
+
+    for i in 0..len {
+        let value = init(i);
+
+        unsafe {
+            ptr.as_ptr().add(i).write(value);
+        }
+
+        guard.initialized += 1;
+    }
+
+    guard.initialized = 0;
+    std::mem::forget(guard);
+
+    if std::mem::needs_drop::<T>() {
+        arena.destructors().borrow_mut().push(Destructor {
+            ptr: ptr.as_ptr().cast(),
+            len,
+            drop_fn: drop_slice::<T>,
+        });
+    }
+
+    unsafe { Ok(std::slice::from_raw_parts_mut(ptr.as_ptr(), len)) }
+}
+
 /// Error for Koliseo creation.
 #[derive(Debug)]
 pub struct KoliseoCreateError;
@@ -199,47 +358,7 @@ impl Koliseo {
 
     /// Allocate a value of type `T`.
     pub fn alloc<T: 'static>(&self, value: T) -> Result<&mut T, KoliseoAllocError> {
-        // Reserve space in the destructor registry first.
-        // This avoids allocating an object that we cannot register.
-        if std::mem::needs_drop::<T>() {
-            self.destructors
-                .borrow_mut()
-                .try_reserve(1)
-                .map_err(|_| KoliseoAllocError)?;
-        }
-
-        let size: isize = std::mem::size_of::<T>()
-            .try_into()
-            .map_err(|_| KoliseoAllocError)?;
-        let alignment: isize = std::mem::align_of::<T>()
-            .try_into()
-            .map_err(|_| KoliseoAllocError)?;
-
-        // Zero-sized types don't need arena memory.
-        let ptr = if size == 0 {
-            NonNull::<T>::dangling().as_ptr().cast::<c_void>()
-        } else {
-            unsafe { koliseo_sys::kls_push_zero(self.ptr.as_ptr(), size, alignment, 1) }
-        };
-
-        let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
-
-        // Move the value into the arena.
-        unsafe {
-            ptr.as_ptr().write(value);
-        }
-
-        // Register its destructor if necessary.
-        if std::mem::needs_drop::<T>() {
-            self.destructors.borrow_mut().push(Destructor {
-                ptr: ptr.as_ptr().cast(),
-                len: 1,
-                drop_fn: drop_value::<T>,
-            });
-        }
-
-        // Return a reference tied to the arena borrow.
-        unsafe { Ok(&mut *ptr.as_ptr()) }
+        alloc_impl(self, value)
     }
 
     /// Allocate a slice of `len` values initialized by `init`.
@@ -254,68 +373,39 @@ impl Koliseo {
     pub fn alloc_slice_with<T: 'static>(
         &self,
         len: usize,
-        mut init: impl FnMut(usize) -> T,
+        init: impl FnMut(usize) -> T,
     ) -> Result<&mut [T], KoliseoAllocError> {
-        if len == 0 {
-            return Ok(&mut []);
-        }
+        alloc_slice_with_impl(self, len, init)
+    }
 
-        // Reserve destructor registry capacity first.
-        if std::mem::needs_drop::<T>() {
-            self.destructors
-                .borrow_mut()
-                .try_reserve(1)
-                .map_err(|_| KoliseoAllocError)?;
-        }
+    /// Execute a closure within a temporary allocation scope.
+    ///
+    /// All previously allocated objects are destroyed before
+    /// entering the scope. All objects allocated within the
+    /// scope are destroyed when the closure returns.
+    ///
+    /// The underlying arena is reset both before and after
+    /// the scope, allowing its memory to be reused.
+    pub fn scope<R>(&mut self, f: impl for<'scope> FnOnce(&'scope KoliseoScope<'scope>) -> R) -> R {
+        // Destroy allocations from the previous arena phase.
+        {
+            let _guard = ResetKoliseo(self.ptr);
 
-        let size: isize = std::mem::size_of::<T>()
-            .try_into()
-            .map_err(|_| KoliseoAllocError)?;
-
-        let alignment: isize = std::mem::align_of::<T>()
-            .try_into()
-            .map_err(|_| KoliseoAllocError)?;
-
-        let i_len: isize = len.try_into().map_err(|_| KoliseoAllocError)?;
-
-        let ptr = if size == 0 {
-            NonNull::<T>::dangling().as_ptr().cast::<c_void>()
-        } else {
-            unsafe { koliseo_sys::kls_push_zero(self.ptr.as_ptr(), size, alignment, i_len) }
-        };
-
-        let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
-
-        // Guard partially initialized elements.
-        let mut guard = SliceInitGuard {
-            ptr,
-            initialized: 0,
-        };
-
-        for i in 0..len {
-            let value = init(i);
-
-            unsafe {
-                ptr.as_ptr().add(i).write(value);
+            for destructor in self.destructors.get_mut().drain(..).rev() {
+                unsafe {
+                    (destructor.drop_fn)(destructor.ptr, destructor.len);
+                }
             }
-
-            guard.initialized += 1;
         }
 
-        // All elements are initialized.
-        // Disarm the guard before registering the destructor.
-        guard.initialized = 0;
-        std::mem::forget(guard);
+        let scope = KoliseoScope {
+            ptr: self.ptr,
+            destructors: RefCell::new(Vec::new()),
+            _arena: PhantomData,
+            _marker: PhantomData,
+        };
 
-        if std::mem::needs_drop::<T>() {
-            self.destructors.borrow_mut().push(Destructor {
-                ptr: ptr.as_ptr().cast(),
-                len,
-                drop_fn: drop_slice::<T>,
-            });
-        }
-
-        unsafe { Ok(std::slice::from_raw_parts_mut(ptr.as_ptr(), len)) }
+        f(&scope)
     }
 }
 
@@ -336,6 +426,65 @@ impl Drop for Koliseo {
         let _guard = DestroyKoliseo(self.ptr);
 
         // Destroy objects in reverse allocation order.
+        for destructor in self.destructors.get_mut().drain(..).rev() {
+            unsafe {
+                (destructor.drop_fn)(destructor.ptr, destructor.len);
+            }
+        }
+    }
+}
+
+/// A temporary allocation scope.
+///
+/// Allocations made through this scope are destroyed when
+/// the scope ends.
+pub struct KoliseoScope<'arena> {
+    ptr: NonNull<koliseo_sys::Koliseo>,
+    destructors: RefCell<Vec<Destructor>>,
+
+    // The scope exclusively borrows its parent arena.
+    _arena: PhantomData<&'arena mut Koliseo>,
+
+    // Prevent automatic Send/Sync implementations.
+    _marker: PhantomData<*mut ()>,
+}
+
+impl KoliseoScope<'_> {
+    /// Allocate a value of type `T` in this scope.
+    pub fn alloc<T: 'static>(&self, value: T) -> Result<&mut T, KoliseoAllocError> {
+        alloc_impl(self, value)
+    }
+
+    /// Allocate a slice of `len` values initialized by `init`.
+    ///
+    /// Elements are stored contiguously in the arena and
+    /// their destructors are called when the scope ends.
+    ///
+    /// If initialization panics, already-initialized elements
+    /// are dropped automatically.
+    pub fn alloc_slice_with<T: 'static>(
+        &self,
+        len: usize,
+        init: impl FnMut(usize) -> T,
+    ) -> Result<&mut [T], KoliseoAllocError> {
+        alloc_slice_with_impl(self, len, init)
+    }
+}
+
+struct ResetKoliseo(NonNull<koliseo_sys::Koliseo>);
+
+impl Drop for ResetKoliseo {
+    fn drop(&mut self) {
+        unsafe {
+            koliseo_sys::kls_clear(self.0.as_ptr());
+        }
+    }
+}
+
+impl Drop for KoliseoScope<'_> {
+    fn drop(&mut self) {
+        let _guard = ResetKoliseo(self.ptr);
+
         for destructor in self.destructors.get_mut().drain(..).rev() {
             unsafe {
                 (destructor.drop_fn)(destructor.ptr, destructor.len);
