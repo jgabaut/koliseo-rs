@@ -32,6 +32,23 @@
 ///
 /// assert_eq!(*number, 42);
 /// assert_eq!(text.as_str(), "Hello, arena!");
+///
+/// let numbers = arena
+///     .alloc_slice_with(10, |i| i * 2)
+///     .unwrap();
+///
+/// assert_eq!(numbers, &[0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+///
+/// let strings = arena
+///     .alloc_slice_with(3, |i| format!("String {i}"))
+///     .unwrap();
+///
+/// assert_eq!(strings[1], "String 1");
+///
+/// let values = arena
+///     .alloc_slice_with(10, |_| String::from("hello"))
+///     .unwrap();
+/// assert_eq!(values[1], "hello");
 /// ```
 ///
 /// ## Destruction
@@ -62,6 +79,35 @@
 ///
 /// assert!(DROPPED.load(Ordering::SeqCst));
 /// ```
+///
+/// ## Slice destruction
+///
+/// Elements allocated in a slice have their destructors called
+/// when the arena is dropped.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// static DROPPED: AtomicUsize = AtomicUsize::new(0);
+///
+/// struct MyObject;
+///
+/// impl Drop for MyObject {
+///     fn drop(&mut self) {
+///         DROPPED.fetch_add(1, Ordering::SeqCst);
+///     }
+/// }
+///
+/// {
+///     let arena = Koliseo::new(1024).unwrap();
+///     arena.alloc_slice_with(3, |_| MyObject).unwrap();
+///
+///     assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
+/// }
+///
+/// assert_eq!(DROPPED.load(Ordering::SeqCst), 3);
+/// ```
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -85,13 +131,38 @@ pub fn api_version_string() -> &'static str {
 /// A function that knows how to destroy a particular type.
 struct Destructor {
     ptr: *mut u8,
-    drop_fn: unsafe fn(*mut u8),
+    len: usize,
+    drop_fn: unsafe fn(*mut u8, usize),
 }
 
 /// Type-specific destructor.
-unsafe fn drop_value<T>(ptr: *mut u8) {
+unsafe fn drop_value<T>(ptr: *mut u8, _len: usize) {
     unsafe {
         std::ptr::drop_in_place(ptr.cast::<T>());
+    }
+}
+
+/// Type-specific slice destructor.
+unsafe fn drop_slice<T>(ptr: *mut u8, len: usize) {
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr.cast::<T>(), len);
+        std::ptr::drop_in_place(slice);
+    }
+}
+
+/// This guard ensures partially initialized slices are cleaned up if the initializer panics.
+struct SliceInitGuard<T> {
+    ptr: NonNull<T>,
+    initialized: usize,
+}
+
+impl<T> Drop for SliceInitGuard<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.initialized);
+
+            std::ptr::drop_in_place(slice);
+        }
     }
 }
 
@@ -162,12 +233,89 @@ impl Koliseo {
         if std::mem::needs_drop::<T>() {
             self.destructors.borrow_mut().push(Destructor {
                 ptr: ptr.as_ptr().cast(),
+                len: 1,
                 drop_fn: drop_value::<T>,
             });
         }
 
         // Return a reference tied to the arena borrow.
         unsafe { Ok(&mut *ptr.as_ptr()) }
+    }
+
+    /// Allocate a slice of `len` values initialized by `init`.
+    ///
+    /// The initializer receives the index of each element.
+    ///
+    /// Elements are stored contiguously in the arena.
+    /// Their destructors are called when the arena is dropped.
+    ///
+    /// If initialization panics, already-initialized elements
+    /// are dropped automatically.
+    pub fn alloc_slice_with<T: 'static>(
+        &self,
+        len: usize,
+        mut init: impl FnMut(usize) -> T,
+    ) -> Result<&mut [T], KoliseoAllocError> {
+        if len == 0 {
+            return Ok(&mut []);
+        }
+
+        // Reserve destructor registry capacity first.
+        if std::mem::needs_drop::<T>() {
+            self.destructors
+                .borrow_mut()
+                .try_reserve(1)
+                .map_err(|_| KoliseoAllocError)?;
+        }
+
+        let size: isize = std::mem::size_of::<T>()
+            .try_into()
+            .map_err(|_| KoliseoAllocError)?;
+
+        let alignment: isize = std::mem::align_of::<T>()
+            .try_into()
+            .map_err(|_| KoliseoAllocError)?;
+
+        let i_len: isize = len.try_into().map_err(|_| KoliseoAllocError)?;
+
+        let ptr = if size == 0 {
+            NonNull::<T>::dangling().as_ptr().cast::<c_void>()
+        } else {
+            unsafe { koliseo_sys::kls_push_zero(self.ptr.as_ptr(), size, alignment, i_len) }
+        };
+
+        let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
+
+        // Guard partially initialized elements.
+        let mut guard = SliceInitGuard {
+            ptr,
+            initialized: 0,
+        };
+
+        for i in 0..len {
+            let value = init(i);
+
+            unsafe {
+                ptr.as_ptr().add(i).write(value);
+            }
+
+            guard.initialized += 1;
+        }
+
+        // All elements are initialized.
+        // Disarm the guard before registering the destructor.
+        guard.initialized = 0;
+        std::mem::forget(guard);
+
+        if std::mem::needs_drop::<T>() {
+            self.destructors.borrow_mut().push(Destructor {
+                ptr: ptr.as_ptr().cast(),
+                len,
+                drop_fn: drop_slice::<T>,
+            });
+        }
+
+        unsafe { Ok(std::slice::from_raw_parts_mut(ptr.as_ptr(), len)) }
     }
 }
 
@@ -190,7 +338,7 @@ impl Drop for Koliseo {
         // Destroy objects in reverse allocation order.
         for destructor in self.destructors.get_mut().drain(..).rev() {
             unsafe {
-                (destructor.drop_fn)(destructor.ptr);
+                (destructor.drop_fn)(destructor.ptr, destructor.len);
             }
         }
     }
