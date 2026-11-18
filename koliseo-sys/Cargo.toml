@@ -5,6 +5,7 @@ edition = "2024"
 repository = "https://github.com/jgabaut/koliseo-rs"
 license = "GPL-3.0-only"
 description = "Raw FFI bindings for koliseo"
+documentation = "https://docs.rs/koliseo-sys"
 
 [dependencies]
 

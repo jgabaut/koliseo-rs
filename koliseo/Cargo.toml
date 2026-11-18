@@ -6,6 +6,7 @@ repository = "https://github.com/jgabaut/koliseo-rs"
 license = "GPL-3.0-only"
 readme = "../README.md"
 description = "Safe Rust bindings for koliseo"
+documentation = "https://docs.rs/koliseo"
 
 [dependencies]
 koliseo-sys = { version = "0.0.0", path = "../koliseo-sys" }
