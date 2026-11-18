@@ -19,6 +19,14 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("koliseo/src/koliseo.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .blocklist_function("malloc")
+        .blocklist_function("realloc")
+        .blocklist_function("memcpy")
+        .blocklist_function("memmove")
+        .blocklist_function("memset")
+        .blocklist_function("memcmp")
+        .blocklist_function("strlen")
+        .blocklist_function("bcmp")
         .generate()
         .expect("Unable to generate bindings");
 
