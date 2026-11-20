@@ -108,6 +108,172 @@
 ///
 /// assert_eq!(DROPPED.load(Ordering::SeqCst), 3);
 /// ```
+///
+/// ## Growing allocations
+///
+/// Existing slices can be grown with [`Koliseo::grow_slice_with`].
+/// The initializer receives the index of each newly added element.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+///
+/// let arena = Koliseo::new(1024).unwrap();
+///
+/// let numbers = arena
+///     .alloc_slice_with(3, |i| i)
+///     .unwrap();
+///
+/// assert_eq!(numbers, &[0, 1, 2]);
+///
+/// let numbers = arena
+///     .grow_slice_with(numbers, 6, |i| i)
+///     .unwrap();
+///
+/// assert_eq!(numbers, &[0, 1, 2, 3, 4, 5]);
+/// ```
+///
+/// ### Growing slices of non-Copy types
+///
+/// Growing also works with types that implement `Drop`.
+/// Existing elements are preserved, and newly added elements
+/// are initialized by the supplied closure.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+///
+/// let arena = Koliseo::new(4096).unwrap();
+///
+/// let strings = arena
+///     .alloc_slice_with(2, |i| format!("String {i}"))
+///     .unwrap();
+///
+/// let strings = arena
+///     .grow_slice_with(strings, 4, |i| format!("String {i}"))
+///     .unwrap();
+///
+/// assert_eq!(strings, [
+///     "String 0",
+///     "String 1",
+///     "String 2",
+///     "String 3",
+/// ]);
+/// ```
+///
+/// ### Growing multiple times
+///
+/// A slice can be grown multiple times.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+///
+/// let arena = Koliseo::new(4096).unwrap();
+///
+/// let values = arena
+///     .alloc_slice_with(2, |i| i)
+///     .unwrap();
+///
+/// let values = arena
+///     .grow_slice_with(values, 4, |i| i)
+///     .unwrap();
+///
+/// assert_eq!(values, &[0, 1, 2, 3]);
+///
+/// let values = arena
+///     .grow_slice_with(values, 8, |i| i)
+///     .unwrap();
+///
+/// assert_eq!(values, &[0, 1, 2, 3, 4, 5, 6, 7]);
+/// ```
+///
+/// ### Growing to the same length
+///
+/// Requesting the current length returns the original slice
+/// without invoking the initializer.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+///
+/// let arena = Koliseo::new(1024).unwrap();
+///
+/// let values = arena
+///     .alloc_slice_with(3, |i| i)
+///     .unwrap();
+///
+/// let values = arena
+///     .grow_slice_with(values, 3, |_| {
+///         panic!("initializer must not be called");
+///     })
+///     .unwrap();
+///
+/// assert_eq!(values, &[0, 1, 2]);
+/// ```
+///
+/// ### Initializer panic safety
+///
+/// If the initializer panics, the original allocation remains
+/// unchanged and its elements are still valid.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+/// use std::panic::{catch_unwind, AssertUnwindSafe};
+///
+/// let arena = Koliseo::new(1024).unwrap();
+///
+/// let values = arena
+///     .alloc_slice_with(3, |i| i)
+///     .unwrap();
+///
+/// let result = catch_unwind(AssertUnwindSafe(|| {
+///     let _ = arena.grow_slice_with(values, 6, |i| {
+///         if i == 4 {
+///             panic!("initializer failed");
+///         }
+///         i
+///     });
+/// }));
+///
+/// assert!(result.is_err());
+/// assert_eq!(values, &[0, 1, 2]);
+/// ```
+///
+/// ### Destruction after growth
+///
+/// Both original and newly initialized elements have their
+/// destructors called when the arena is dropped.
+///
+/// ```rust
+/// use koliseo::Koliseo;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// static DROPPED: AtomicUsize = AtomicUsize::new(0);
+///
+/// struct MyObject(u8);
+///
+/// impl Drop for MyObject {
+///     fn drop(&mut self) {
+///         DROPPED.fetch_add(1, Ordering::SeqCst);
+///     }
+/// }
+///
+/// DROPPED.store(0, Ordering::SeqCst);
+///
+/// {
+///     let arena = Koliseo::new(2048).unwrap();
+///
+///     let objects = arena
+///         .alloc_slice_with(2, |_| MyObject(1))
+///         .unwrap();
+///
+///     let objects = arena
+///         .grow_slice_with(objects, 5, |_| MyObject(2))
+///         .unwrap();
+///
+///     assert_eq!(objects.len(), 5);
+///     assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
+/// }
+///
+/// assert_eq!(DROPPED.load(Ordering::SeqCst), 5);
+/// ```
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -126,6 +292,14 @@ pub fn api_version_string() -> &'static str {
     let bytes = &bytes[..bytes.len() - 1];
 
     std::str::from_utf8(bytes).expect("Koliseo API version string must be valid UTF-8")
+}
+
+struct Allocation {
+    ptr: *mut u8,
+    size: usize,
+    align: usize,
+    count: usize,
+    is_slice: bool,
 }
 
 /// A function that knows how to destroy a particular type.
@@ -178,7 +352,7 @@ pub struct KoliseoAllocError;
 pub struct Koliseo {
     ptr: NonNull<koliseo_sys::Koliseo>,
     destructors: RefCell<Vec<Destructor>>,
-
+    allocations: RefCell<Vec<Allocation>>,
     // Prevents automatic Send/Sync implementations.
     _marker: PhantomData<*mut ()>,
 }
@@ -193,6 +367,7 @@ impl Koliseo {
         Ok(Self {
             ptr,
             destructors: RefCell::new(Vec::new()),
+            allocations: RefCell::new(Vec::new()),
             _marker: PhantomData,
         })
     }
@@ -224,6 +399,11 @@ impl Koliseo {
 
         let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
 
+        self.allocations
+            .borrow_mut()
+            .try_reserve(1)
+            .map_err(|_| KoliseoAllocError)?;
+
         // Move the value into the arena.
         unsafe {
             ptr.as_ptr().write(value);
@@ -237,6 +417,14 @@ impl Koliseo {
                 drop_fn: drop_value::<T>,
             });
         }
+
+        self.allocations.borrow_mut().push(Allocation {
+            ptr: ptr.as_ptr().cast(),
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+            count: 1,
+            is_slice: false,
+        });
 
         // Return a reference tied to the arena borrow.
         unsafe { Ok(&mut *ptr.as_ptr()) }
@@ -286,6 +474,11 @@ impl Koliseo {
 
         let ptr = NonNull::new(ptr.cast::<T>()).ok_or(KoliseoAllocError)?;
 
+        self.allocations
+            .borrow_mut()
+            .try_reserve(len)
+            .map_err(|_| KoliseoAllocError)?;
+
         // Guard partially initialized elements.
         let mut guard = SliceInitGuard {
             ptr,
@@ -315,7 +508,147 @@ impl Koliseo {
             });
         }
 
+        self.allocations.borrow_mut().push(Allocation {
+            ptr: ptr.as_ptr().cast(),
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+            count: len,
+            is_slice: true,
+        });
+
         unsafe { Ok(std::slice::from_raw_parts_mut(ptr.as_ptr(), len)) }
+    }
+
+    pub fn grow_slice_with<'a, T: 'static>(
+        &self,
+        old: &'a mut [T],
+        new_len: usize,
+        mut init: impl FnMut(usize) -> T,
+    ) -> Result<&'a mut [T], KoliseoAllocError> {
+        let old_len = old.len();
+
+        if new_len < old_len {
+            return Err(KoliseoAllocError);
+        }
+
+        if new_len == old_len {
+            return Ok(old);
+        }
+
+        let size = std::mem::size_of::<T>();
+        let align = std::mem::align_of::<T>();
+
+        // Empty slices aren't registered allocations.
+        if old_len == 0 {
+            return Err(KoliseoAllocError);
+        }
+
+        // A slice pointer cannot uniquely identify a ZST allocation.
+        if size == 0 {
+            return Err(KoliseoAllocError);
+        }
+
+        // Validate all integer conversions before doing anything.
+        let size_i: isize = size.try_into().map_err(|_| KoliseoAllocError)?;
+
+        let align_i: isize = align.try_into().map_err(|_| KoliseoAllocError)?;
+
+        let old_count: isize = old_len.try_into().map_err(|_| KoliseoAllocError)?;
+
+        let new_count: isize = new_len.try_into().map_err(|_| KoliseoAllocError)?;
+
+        // Also check multiplication explicitly.
+        let total_size = size
+            .checked_mul(new_len)
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or(KoliseoAllocError)?;
+
+        let old_ptr = old.as_mut_ptr();
+
+        // Initialize new elements in temporary storage FIRST.
+        // If init panics, the original allocation is untouched.
+        let additional = new_len - old_len;
+
+        let mut additions = Vec::new();
+
+        additions
+            .try_reserve_exact(additional)
+            .map_err(|_| KoliseoAllocError)?;
+
+        for i in old_len..new_len {
+            additions.push(init(i));
+        }
+
+        // Validate the allocation and destructor registrations.
+        let mut allocations = self.allocations.borrow_mut();
+
+        let allocation_index = allocations
+            .iter()
+            .position(|allocation| {
+                allocation.ptr == old_ptr.cast()
+                    && allocation.size == size
+                    && allocation.align == align
+                    && allocation.count == old_len
+                    && allocation.is_slice
+            })
+            .ok_or(KoliseoAllocError)?;
+
+        let mut destructors = self.destructors.borrow_mut();
+
+        let destructor_index = if std::mem::needs_drop::<T>() {
+            Some(
+                destructors
+                    .iter()
+                    .position(|destructor| {
+                        destructor.ptr == old_ptr.cast() && destructor.len == old_len
+                    })
+                    .ok_or(KoliseoAllocError)?,
+            )
+        } else {
+            None
+        };
+
+        // All potentially failing Rust-side checks are complete.
+        // Call kls_repush.
+        let new_ptr = unsafe {
+            koliseo_sys::kls_repush(
+                self.ptr.as_ptr(),
+                old_ptr.cast(),
+                size_i,
+                align_i,
+                old_count,
+                new_count,
+            )
+        };
+
+        let Some(new_ptr) = NonNull::new(new_ptr.cast::<T>()) else {
+            return Err(KoliseoAllocError);
+        };
+
+        // Update allocation metadata immediately.
+        allocations[allocation_index].ptr = new_ptr.as_ptr().cast();
+
+        allocations[allocation_index].count = new_len;
+
+        // Update the destructor registration.
+        if let Some(index) = destructor_index {
+            destructors[index].ptr = new_ptr.as_ptr().cast();
+            destructors[index].len = new_len;
+        }
+
+        drop(destructors);
+        drop(allocations);
+
+        // Transfer the initialized values into the arena.
+        // No user code or fallible operation remains here.
+        for (offset, value) in additions.into_iter().enumerate() {
+            unsafe {
+                new_ptr.as_ptr().add(old_len + offset).write(value);
+            }
+        }
+
+        // Return the new slice.
+        unsafe { Ok(std::slice::from_raw_parts_mut(new_ptr.as_ptr(), new_len)) }
     }
 }
 
