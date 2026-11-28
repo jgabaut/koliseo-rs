@@ -1,6 +1,6 @@
 [package]
 name = "koliseo"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 repository = "https://github.com/jgabaut/koliseo-rs"
 license = "GPL-3.0-only"
@@ -9,4 +9,4 @@ description = "Safe Rust bindings for koliseo"
 documentation = "https://docs.rs/koliseo"
 
 [dependencies]
-koliseo-sys = { version = "0.0.0", path = "../koliseo-sys" }
+koliseo-sys = { version = "0.0.1", path = "../koliseo-sys" }
